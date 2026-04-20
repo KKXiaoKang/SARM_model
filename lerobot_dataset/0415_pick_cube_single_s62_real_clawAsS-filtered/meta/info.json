@@ -1,0 +1,162 @@
+{
+    "codebase_version": "v3.0",
+    "robot_type": "kuavo45",
+    "total_episodes": 35,
+    "total_frames": 7172,
+    "total_tasks": 1,
+    "chunks_size": 1000,
+    "fps": 10,
+    "splits": {
+        "train": "0:35"
+    },
+    "data_path": "data/chunk-{chunk_index:03d}/file-{file_index:03d}.parquet",
+    "video_path": null,
+    "features": {
+        "observation.images.cam_head": {
+            "dtype": "image",
+            "shape": [
+                3,
+                480,
+                640
+            ],
+            "names": [
+                "channels",
+                "height",
+                "width"
+            ],
+            "fps": 10
+        },
+        "observation.images.cam_left": {
+            "dtype": "image",
+            "shape": [
+                3,
+                480,
+                640
+            ],
+            "names": [
+                "channels",
+                "height",
+                "width"
+            ],
+            "fps": 10
+        },
+        "observation.images.cam_right": {
+            "dtype": "image",
+            "shape": [
+                3,
+                480,
+                640
+            ],
+            "names": [
+                "channels",
+                "height",
+                "width"
+            ],
+            "fps": 10
+        },
+        "observation.state": {
+            "dtype": "float32",
+            "shape": [
+                20
+            ],
+            "names": {
+                "motors": [
+                    "left_eef_x",
+                    "left_eef_y",
+                    "left_eef_z",
+                    "left_eef_R11",
+                    "left_eef_R21",
+                    "left_eef_R31",
+                    "left_eef_R12",
+                    "left_eef_R22",
+                    "left_eef_R32",
+                    "right_eef_x",
+                    "right_eef_y",
+                    "right_eef_z",
+                    "right_eef_R11",
+                    "right_eef_R21",
+                    "right_eef_R31",
+                    "right_eef_R12",
+                    "right_eef_R22",
+                    "right_eef_R32",
+                    "left_gripper",
+                    "right_gripper"
+                ]
+            },
+            "fps": 10
+        },
+        "action": {
+            "dtype": "float32",
+            "shape": [
+                20
+            ],
+            "names": {
+                "motors": [
+                    "left_eef_x",
+                    "left_eef_y",
+                    "left_eef_z",
+                    "left_eef_R11",
+                    "left_eef_R21",
+                    "left_eef_R31",
+                    "left_eef_R12",
+                    "left_eef_R22",
+                    "left_eef_R32",
+                    "right_eef_x",
+                    "right_eef_y",
+                    "right_eef_z",
+                    "right_eef_R11",
+                    "right_eef_R21",
+                    "right_eef_R31",
+                    "right_eef_R12",
+                    "right_eef_R22",
+                    "right_eef_R32",
+                    "left_gripper",
+                    "right_gripper"
+                ]
+            },
+            "fps": 10
+        },
+        "timestamp": {
+            "dtype": "float32",
+            "shape": [
+                1
+            ],
+            "names": null,
+            "fps": 10
+        },
+        "frame_index": {
+            "dtype": "int64",
+            "shape": [
+                1
+            ],
+            "names": null,
+            "fps": 10
+        },
+        "episode_index": {
+            "dtype": "int64",
+            "shape": [
+                1
+            ],
+            "names": null,
+            "fps": 10
+        },
+        "index": {
+            "dtype": "int64",
+            "shape": [
+                1
+            ],
+            "names": null,
+            "fps": 10
+        },
+        "task_index": {
+            "dtype": "int64",
+            "shape": [
+                1
+            ],
+            "names": null,
+            "fps": 10
+        }
+    },
+    "data_files_size_in_mb": 100,
+    "video_files_size_in_mb": 500
+}

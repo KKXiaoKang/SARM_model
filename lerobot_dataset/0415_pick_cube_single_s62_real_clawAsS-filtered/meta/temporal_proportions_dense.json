@@ -1,0 +1,10 @@
+{
+  "Move the gripper above the orange small cube on the table": 0.13793355590353965,
+  "lower to grasp it": 0.1287572945135627,
+  "lift it off the table": 0.1244717521043853,
+  "carry it to the packaging box": 0.22468579347733503,
+  "align above the box": 0.10892267681835818,
+  "place the cube into the box": 0.0969223319988547,
+  "release it": 0.053164060530005365,
+  "and then return to the home position.": 0.056150971588081244
+}
