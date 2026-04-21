@@ -995,8 +995,8 @@ Examples:
     parser.add_argument(
         "--push-to-hub",
         action="store_true",
-        help="Upload progress file to the dataset repo on HuggingFace Hub",
-        default=True,
+        default=False,
+        help="Upload progress parquet to the HuggingFace dataset repo (requires --dataset-repo-id like org/name, not a local path)",
     )
     parser.add_argument(
         "--stride",
@@ -1071,20 +1071,27 @@ Examples:
 
     print(f"\nSARM progress values saved to: {output_path}")
 
-    # Upload to Hub if requested
+    # Upload to Hub if requested (Hub repo id must be org/name, not a filesystem path)
     if args.push_to_hub:
         from huggingface_hub import HfApi
+        from huggingface_hub.utils import HFValidationError
 
         api = HfApi()
         hub_path = "sarm_progress.parquet"
 
-        print(f"\nUploading to Hub: {args.dataset_repo_id}/{hub_path}")
-        api.upload_file(
-            path_or_fileobj=str(output_path),
-            path_in_repo=hub_path,
-            repo_id=args.dataset_repo_id,
-            repo_type="dataset",
-        )
+        try:
+            print(f"\nUploading to Hub: {args.dataset_repo_id}/{hub_path}")
+            api.upload_file(
+                path_or_fileobj=str(output_path),
+                path_in_repo=hub_path,
+                repo_id=args.dataset_repo_id,
+                repo_type="dataset",
+            )
+        except HFValidationError as e:
+            raise ValueError(
+                "Upload failed: --dataset-repo-id must be a HuggingFace dataset id (e.g. org/name), "
+                "not a local folder. Omit --push-to-hub when using a local dataset, or pass a valid Hub id."
+            ) from e
         print(
             f"Successfully uploaded to: https://huggingface.co/datasets/{args.dataset_repo_id}/blob/main/{hub_path}"
         )
