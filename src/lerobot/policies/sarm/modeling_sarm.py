@@ -22,8 +22,10 @@ Paper: https://arxiv.org/abs/2509.25358
 
 - StageTransformer: Predicts stage classification (sparse/dense)
 - SubtaskTransformer: Predicts within-stage progress (tau) conditioned on stage
+- ARMAdvantageTransformer: Predicts tri-state advantage labels (regressive/stagnant/progressive)
 """
 
+from itertools import chain
 import json
 import logging
 import random
@@ -333,6 +335,102 @@ class SubtaskTransformer(nn.Module):
         return r
 
 
+class ARMAdvantageTransformer(nn.Module):
+    """
+    ARM MIMO head for tri-state advantage prediction.
+
+    Predicts per-frame labels in {regressive, stagnant, progressive} using short-term temporal context.
+    """
+
+    def __init__(
+        self,
+        d_model: int = 512,
+        vis_emb_dim: int = 512,
+        text_emb_dim: int = 512,
+        state_dim: int = 32,
+        n_layers: int = 6,
+        n_heads: int = 8,
+        dropout: float = 0.1,
+        num_cameras: int = 1,
+        window_size: int = 5,
+    ):
+        super().__init__()
+        self.d_model = d_model
+        self.num_cameras = num_cameras
+        self.window_size = max(1, int(window_size))
+
+        self.lang_proj = nn.Linear(text_emb_dim, d_model)
+        self.visual_proj = nn.Linear(vis_emb_dim, d_model)
+        self.state_proj = nn.Linear(state_dim, d_model)
+
+        enc_layer = nn.TransformerEncoderLayer(d_model, n_heads, 4 * d_model, dropout, batch_first=True)
+        self.transformer = nn.TransformerEncoder(enc_layer, n_layers)
+        self.first_pos = nn.Parameter(torch.zeros(1, d_model))
+
+        fused_in = d_model * (num_cameras + 2)
+        self.fusion_backbone = nn.Sequential(
+            nn.LayerNorm(fused_in),
+            nn.Linear(fused_in, d_model),
+            nn.ReLU(),
+        )
+
+        # 0=regressive, 1=stagnant, 2=progressive
+        self.heads = nn.ModuleDict(
+            {
+                "sparse": nn.Linear(d_model, 3),
+                "dense": nn.Linear(d_model, 3),
+            }
+        )
+
+    def _prep_lang(self, lang_emb: torch.Tensor, batch_size: int, seq_len: int, d_model: int) -> torch.Tensor:
+        if lang_emb.dim() == 3:
+            return self.lang_proj(lang_emb).unsqueeze(1)
+        return self.lang_proj(lang_emb).unsqueeze(1).unsqueeze(2).expand(batch_size, 1, seq_len, d_model)
+
+    def _apply_local_context(self, fused: torch.Tensor) -> torch.Tensor:
+        if self.window_size <= 1:
+            return fused
+        pad = self.window_size // 2
+        x = fused.transpose(1, 2)
+        x = F.pad(x, (pad, pad), mode="replicate")
+        x = F.avg_pool1d(x, kernel_size=self.window_size, stride=1)
+        return x.transpose(1, 2)
+
+    def forward(
+        self,
+        img_seq: torch.Tensor,  # (B, N, T, vis_emb_dim)
+        lang_emb: torch.Tensor,  # (B, E) or (B, T, E)
+        state: torch.Tensor,  # (B, T, state_dim)
+        lengths: torch.Tensor,  # (B,)
+        scheme: str = "sparse",
+    ) -> torch.Tensor:
+        assert scheme in self.heads, f"Unknown scheme '{scheme}'. Use one of {list(self.heads.keys())}."
+
+        batch_size, num_cameras, seq_len, _ = img_seq.shape
+        d_model = self.d_model
+        device = img_seq.device
+
+        vis_proj = self.visual_proj(img_seq)
+        state_proj = self.state_proj(state).unsqueeze(1)
+        lang_proj = self._prep_lang(lang_emb, batch_size, seq_len, d_model)
+
+        x = torch.cat([vis_proj, lang_proj, state_proj], dim=1)
+        x[:, :num_cameras, 0, :] = x[:, :num_cameras, 0, :] + self.first_pos
+
+        x_tokens = x.view(batch_size, (num_cameras + 2) * seq_len, d_model)
+        token_count = x_tokens.size(1)
+        base_mask = torch.arange(seq_len, device=device).expand(batch_size, seq_len) >= lengths.unsqueeze(1)
+        mask = base_mask.unsqueeze(1).expand(batch_size, num_cameras + 2, seq_len).reshape(batch_size, token_count)
+        causal_mask = torch.triu(torch.ones(token_count, token_count, device=device, dtype=torch.bool), diagonal=1)
+
+        h = self.transformer(x_tokens, mask=causal_mask, src_key_padding_mask=mask, is_causal=True)
+        h = h.view(batch_size, num_cameras + 2, seq_len, d_model).permute(0, 2, 1, 3)
+        h = h.reshape(batch_size, seq_len, (num_cameras + 2) * d_model)
+        fused = self.fusion_backbone(h)
+        fused = self._apply_local_context(fused)
+        return self.heads[scheme](fused)
+
+
 def gen_stage_emb(num_classes: int, targets: torch.Tensor) -> torch.Tensor:
     """
     Generate one-hot stage embeddings from targets.
@@ -366,12 +464,16 @@ class SARMRewardModel(PreTrainedPolicy):
 
     name = "sarm"
     config_class = SARMConfig
+    REGRESSIVE_LABEL = 0
+    STAGNANT_LABEL = 1
+    PROGRESSIVE_LABEL = 2
 
     def __init__(self, config: SARMConfig, dataset_stats: dict | None = None, dataset_meta=None):
         super().__init__(config, dataset_stats)
         config.validate_features()
         self.config = config
         self.dataset_stats = dataset_stats
+        self.reward_mode = config.reward_mode
         self.device = torch.device(
             config.device if config.device else "cuda" if torch.cuda.is_available() else "cpu"
         )
@@ -382,33 +484,49 @@ class SARMRewardModel(PreTrainedPolicy):
         elif dataset_meta is not None:
             self._load_temporal_proportions(dataset_meta)
 
-        # Create two separate models
-        self.stage_model = StageTransformer(
-            d_model=config.hidden_dim,
-            vis_emb_dim=config.image_dim,
-            text_emb_dim=config.text_dim,
-            state_dim=config.max_state_dim,
-            n_layers=config.num_layers,
-            n_heads=config.num_heads,
-            dropout=config.dropout,
-            num_cameras=1,  # Single camera for now
-            num_classes_sparse=config.num_sparse_stages,
-            num_classes_dense=config.num_dense_stages or config.num_sparse_stages,
-        )
+        self.stage_model: StageTransformer | None = None
+        self.subtask_model: SubtaskTransformer | None = None
+        self.arm_model: ARMAdvantageTransformer | None = None
 
-        self.subtask_model = SubtaskTransformer(
-            d_model=config.hidden_dim,
-            vis_emb_dim=config.image_dim,
-            text_emb_dim=config.text_dim,
-            state_dim=config.max_state_dim,
-            n_layers=config.num_layers,
-            n_heads=config.num_heads,
-            dropout=config.dropout,
-            num_cameras=1,
-        )
+        if self.reward_mode == "sarm":
+            self.stage_model = StageTransformer(
+                d_model=config.hidden_dim,
+                vis_emb_dim=config.image_dim,
+                text_emb_dim=config.text_dim,
+                state_dim=config.max_state_dim,
+                n_layers=config.num_layers,
+                n_heads=config.num_heads,
+                dropout=config.dropout,
+                num_cameras=1,  # Single camera for now
+                num_classes_sparse=config.num_sparse_stages,
+                num_classes_dense=config.num_dense_stages or config.num_sparse_stages,
+            )
 
-        self.stage_model.to(self.device)
-        self.subtask_model.to(self.device)
+            self.subtask_model = SubtaskTransformer(
+                d_model=config.hidden_dim,
+                vis_emb_dim=config.image_dim,
+                text_emb_dim=config.text_dim,
+                state_dim=config.max_state_dim,
+                n_layers=config.num_layers,
+                n_heads=config.num_heads,
+                dropout=config.dropout,
+                num_cameras=1,
+            )
+            self.stage_model.to(self.device)
+            self.subtask_model.to(self.device)
+        else:
+            self.arm_model = ARMAdvantageTransformer(
+                d_model=config.hidden_dim,
+                vis_emb_dim=config.image_dim,
+                text_emb_dim=config.text_dim,
+                state_dim=config.max_state_dim,
+                n_layers=config.num_layers,
+                n_heads=config.num_heads,
+                dropout=config.dropout,
+                num_cameras=1,
+                window_size=config.arm_window_size,
+            )
+            self.arm_model.to(self.device)
 
         # GT/predicted stage ratio for teacher forcing
         self.gt_stage_ratio = 0.75
@@ -421,7 +539,7 @@ class SARMRewardModel(PreTrainedPolicy):
         else:
             logging.info(f"SARM initialized with sparse head only: {config.num_sparse_stages} stages")
 
-        logging.info(f"SARM initialized on {self.device}")
+        logging.info(f"SARM initialized on {self.device} with reward_mode={self.reward_mode}")
 
     def _load_proportions_from_json(self, path, annotation_type: str) -> tuple[list[str], list[float]]:
         """Load temporal proportions from a JSON file (preserving order)."""
@@ -467,8 +585,12 @@ class SARMRewardModel(PreTrainedPolicy):
         """Override to method to ensure all components move together."""
         super().to(device)
         self.device = device if isinstance(device, torch.device) else torch.device(device)
-        self.stage_model.to(device)
-        self.subtask_model.to(device)
+        if self.stage_model is not None:
+            self.stage_model.to(device)
+        if self.subtask_model is not None:
+            self.subtask_model.to(device)
+        if self.arm_model is not None:
+            self.arm_model.to(device)
         return self
 
     @torch.no_grad()
@@ -505,68 +627,45 @@ class SARMRewardModel(PreTrainedPolicy):
         Returns:
             Rewards and optionally stage probs/confidence.
         """
-        if isinstance(text_embeddings, np.ndarray):
-            text_embeddings = torch.tensor(text_embeddings, dtype=torch.float32)
-        if isinstance(video_embeddings, np.ndarray):
-            video_embeddings = torch.tensor(video_embeddings, dtype=torch.float32)
-        if state_features is not None and isinstance(state_features, np.ndarray):
-            state_features = torch.tensor(state_features, dtype=torch.float32)
-
-        # Handle single sample case
-        if text_embeddings.dim() == 1:
-            text_embeddings = text_embeddings.unsqueeze(0)
-            video_embeddings = video_embeddings.unsqueeze(0)
-            if state_features is not None:
-                state_features = state_features.unsqueeze(0)
-            single_sample = True
-        else:
-            single_sample = False
-
-        batch_size = video_embeddings.shape[0]
-        seq_len = video_embeddings.shape[1]
-
-        scheme = head_mode
-
-        # Default lengths if not provided
-        if lengths is None:
-            lengths = torch.full((batch_size,), seq_len, dtype=torch.int32)
-        elif isinstance(lengths, np.ndarray):
-            lengths = torch.tensor(lengths, dtype=torch.int32)
-
-        # Reshape video to (B, N, T, D) for multi-camera format
-        # Currently single camera: (B, T, D) -> (B, 1, T, D)
-        img_seq = video_embeddings.unsqueeze(1).to(self.device)
-        lang_emb = text_embeddings.to(self.device)
-        state = (
-            state_features.to(self.device)
-            if state_features is not None
-            else torch.zeros(batch_size, seq_len, self.config.max_state_dim, device=self.device)
+        img_seq, lang_emb, state, lens, single_sample = self._prepare_reward_inputs(
+            text_embeddings=text_embeddings,
+            video_embeddings=video_embeddings,
+            state_features=state_features,
+            lengths=lengths,
         )
-        lens = lengths.to(self.device)
 
-        # Pad state to max_state_dim
-        state = pad_state_to_max_dim(state, self.config.max_state_dim)
+        if frame_index is None:
+            frame_index = self.config.n_obs_steps
+        scheme = head_mode or "sparse"
 
-        # Get num_classes for this scheme
+        if self.reward_mode == "arm":
+            return self._calculate_rewards_arm(
+                img_seq=img_seq,
+                lang_emb=lang_emb,
+                state=state,
+                lens=lens,
+                head_mode=scheme,
+                return_all_frames=return_all_frames,
+                return_stages=return_stages,
+                return_confidence=return_confidence,
+                frame_index=frame_index,
+                single_sample=single_sample,
+            )
+
+        if self.stage_model is None or self.subtask_model is None:
+            raise RuntimeError("SARM mode expects stage_model and subtask_model to be initialized.")
+
         num_classes = self.config.num_sparse_stages if scheme == "sparse" else self.config.num_dense_stages
-
-        # Run stage model
         stage_logits = self.stage_model(img_seq, lang_emb, state, lens, scheme=scheme)
-        stage_probs = F.softmax(stage_logits, dim=-1)  # (B, T, num_classes)
-        stage_idx = stage_probs.argmax(dim=-1)  # (B, T)
-        stage_conf = stage_probs.gather(-1, stage_idx.unsqueeze(-1)).squeeze(-1)  # (B, T)
+        stage_probs = F.softmax(stage_logits, dim=-1)
+        stage_idx = stage_probs.argmax(dim=-1)
+        stage_conf = stage_probs.gather(-1, stage_idx.unsqueeze(-1)).squeeze(-1)
 
-        # Create one-hot stage prior
-        stage_onehot = F.one_hot(stage_idx, num_classes=num_classes).float()  # (B, T, C)
-        stage_emb = stage_onehot.unsqueeze(1)  # (B, 1, T, C)
-
-        # Run subtask model
+        stage_onehot = F.one_hot(stage_idx, num_classes=num_classes).float()
+        stage_emb = stage_onehot.unsqueeze(1)
         tau_pred = self.subtask_model(img_seq, lang_emb, state, lens, stage_emb, scheme=scheme)
+        raw_reward = stage_idx.float() + tau_pred
 
-        # Compute final reward: stage + tau
-        raw_reward = stage_idx.float() + tau_pred  # (B, T)
-
-        # Normalize to [0, 1] using temporal proportions for proper weighting
         if scheme == "sparse":
             normalized_reward = normalize_stage_tau(
                 raw_reward,
@@ -582,11 +681,6 @@ class SARMRewardModel(PreTrainedPolicy):
                 subtask_names=self.config.dense_subtask_names,
             )
 
-        # Default frame index is n_obs_steps (last observation frame)
-        if frame_index is None:
-            frame_index = self.config.n_obs_steps
-
-        # Prepare outputs (batch mode or no smoothing)
         if return_all_frames:
             rewards = normalized_reward.cpu().numpy()
         else:
@@ -609,11 +703,104 @@ class SARMRewardModel(PreTrainedPolicy):
 
         return outputs[0] if len(outputs) == 1 else tuple(outputs)
 
+    def _prepare_reward_inputs(
+        self,
+        text_embeddings: np.ndarray | torch.Tensor,
+        video_embeddings: np.ndarray | torch.Tensor,
+        state_features: np.ndarray | torch.Tensor | None = None,
+        lengths: np.ndarray | torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, bool]:
+        if isinstance(text_embeddings, np.ndarray):
+            text_embeddings = torch.tensor(text_embeddings, dtype=torch.float32)
+        if isinstance(video_embeddings, np.ndarray):
+            video_embeddings = torch.tensor(video_embeddings, dtype=torch.float32)
+        if state_features is not None and isinstance(state_features, np.ndarray):
+            state_features = torch.tensor(state_features, dtype=torch.float32)
+
+        if text_embeddings.dim() == 1:
+            text_embeddings = text_embeddings.unsqueeze(0)
+            video_embeddings = video_embeddings.unsqueeze(0)
+            if state_features is not None:
+                state_features = state_features.unsqueeze(0)
+            single_sample = True
+        else:
+            single_sample = False
+
+        batch_size = video_embeddings.shape[0]
+        seq_len = video_embeddings.shape[1]
+        if lengths is None:
+            lengths = torch.full((batch_size,), seq_len, dtype=torch.int32)
+        elif isinstance(lengths, np.ndarray):
+            lengths = torch.tensor(lengths, dtype=torch.int32)
+
+        img_seq = video_embeddings.unsqueeze(1).to(self.device)
+        lang_emb = text_embeddings.to(self.device)
+        state = (
+            state_features.to(self.device)
+            if state_features is not None
+            else torch.zeros(batch_size, seq_len, self.config.max_state_dim, device=self.device)
+        )
+        lens = lengths.to(self.device)
+        state = pad_state_to_max_dim(state, self.config.max_state_dim)
+        return img_seq, lang_emb, state, lens, single_sample
+
+    def _signed_advantage_to_progress(self, signed_advantage: torch.Tensor) -> torch.Tensor:
+        scale = max(float(self.config.arm_progress_scale), 1e-6)
+        accumulated = torch.cumsum(signed_advantage, dim=1) / scale
+        return torch.sigmoid(accumulated)
+
+    def _calculate_rewards_arm(
+        self,
+        img_seq: torch.Tensor,
+        lang_emb: torch.Tensor,
+        state: torch.Tensor,
+        lens: torch.Tensor,
+        head_mode: str,
+        return_all_frames: bool,
+        return_stages: bool,
+        return_confidence: bool,
+        frame_index: int,
+        single_sample: bool,
+    ) -> np.ndarray | tuple:
+        if self.arm_model is None:
+            raise RuntimeError("ARM mode expects arm_model to be initialized.")
+
+        logits = self.arm_model(img_seq, lang_emb, state, lens, scheme=head_mode)
+        tri_probs = F.softmax(logits, dim=-1)
+        tri_conf = tri_probs.max(dim=-1).values
+        signed_adv = tri_probs[..., self.PROGRESSIVE_LABEL] - tri_probs[..., self.REGRESSIVE_LABEL]
+        normalized_reward = self._signed_advantage_to_progress(signed_adv)
+
+        if return_all_frames:
+            rewards = normalized_reward.cpu().numpy()
+        else:
+            rewards = normalized_reward[:, frame_index].cpu().numpy()
+
+        if single_sample:
+            rewards = rewards[0] if not return_all_frames else rewards[0]
+
+        outputs = [rewards]
+        if return_stages:
+            probs = tri_probs.cpu().numpy()
+            if single_sample:
+                probs = probs[0]
+            outputs.append(probs)
+        if return_confidence:
+            conf = tri_conf.cpu().numpy()
+            if single_sample:
+                conf = conf[0]
+            outputs.append(conf)
+        return outputs[0] if len(outputs) == 1 else tuple(outputs)
+
     def train(self, mode: bool = True):
         """Set training mode for both models."""
         super().train(mode)
-        self.stage_model.train(mode)
-        self.subtask_model.train(mode)
+        if self.stage_model is not None:
+            self.stage_model.train(mode)
+        if self.subtask_model is not None:
+            self.subtask_model.train(mode)
+        if self.arm_model is not None:
+            self.arm_model.train(mode)
         return self
 
     def eval(self):
@@ -622,9 +809,14 @@ class SARMRewardModel(PreTrainedPolicy):
 
     def parameters(self):
         """Override to return trainable parameters from both models."""
-        from itertools import chain
-
-        return chain(self.stage_model.parameters(), self.subtask_model.parameters())
+        modules = []
+        if self.stage_model is not None:
+            modules.append(self.stage_model.parameters())
+        if self.subtask_model is not None:
+            modules.append(self.subtask_model.parameters())
+        if self.arm_model is not None:
+            modules.append(self.arm_model.parameters())
+        return chain(*modules)
 
     def get_optim_params(self):
         """Override to return optimizer parameters from both models."""
@@ -667,6 +859,9 @@ class SARMRewardModel(PreTrainedPolicy):
         Returns:
             Dict with stage_loss, subtask_loss, total_loss
         """
+        if self.stage_model is None or self.subtask_model is None:
+            raise RuntimeError("SARM mode expects stage_model and subtask_model to be initialized.")
+
         num_classes = self.config.num_sparse_stages if scheme == "sparse" else self.config.num_dense_stages
 
         # Ground truth: stage (integer) and tau (fractional)
@@ -701,15 +896,93 @@ class SARMRewardModel(PreTrainedPolicy):
             "total_loss": stage_loss + subtask_loss,
         }
 
+    def _progress_targets_to_advantage_targets(
+        self,
+        progress_targets: torch.Tensor,
+        lengths: torch.Tensor,
+        scheme: str,
+    ) -> torch.Tensor:
+        """Derive tri-state labels from stage+tau targets for ARM fallback supervision."""
+        batch_size, seq_len = progress_targets.shape
+        labels = torch.full(
+            (batch_size, seq_len),
+            self.STAGNANT_LABEL,
+            dtype=torch.long,
+            device=progress_targets.device,
+        )
+        horizon = int(self.config.arm_label_horizon)
+        pos_th = float(self.config.advantage_positive_threshold)
+        neg_th = float(self.config.advantage_negative_threshold)
+        if scheme == "dense":
+            num_stages = self.config.num_dense_stages or self.config.num_sparse_stages
+            normalized = normalize_stage_tau(
+                progress_targets,
+                num_stages=max(1, num_stages),
+                temporal_proportions=self.config.dense_temporal_proportions,
+                subtask_names=self.config.dense_subtask_names,
+            )
+        else:
+            normalized = normalize_stage_tau(
+                progress_targets,
+                num_stages=max(1, self.config.num_sparse_stages),
+                temporal_proportions=self.config.sparse_temporal_proportions,
+                subtask_names=self.config.sparse_subtask_names,
+            )
+
+        for b_idx in range(batch_size):
+            valid_len = int(lengths[b_idx].item())
+            if valid_len <= 0:
+                continue
+            for t_idx in range(valid_len):
+                future_idx = min(t_idx + horizon, valid_len - 1)
+                delta = float(normalized[b_idx, future_idx] - normalized[b_idx, t_idx])
+                if delta > pos_th:
+                    labels[b_idx, t_idx] = self.PROGRESSIVE_LABEL
+                elif delta < neg_th:
+                    labels[b_idx, t_idx] = self.REGRESSIVE_LABEL
+                else:
+                    labels[b_idx, t_idx] = self.STAGNANT_LABEL
+
+        return labels
+
+    def _train_step_arm(
+        self,
+        img_emb: torch.Tensor,
+        lang_emb: torch.Tensor,
+        state: torch.Tensor,
+        lengths: torch.Tensor,
+        advantage_targets: torch.Tensor,
+        scheme: str,
+    ) -> dict[str, torch.Tensor]:
+        """Single training step for ARM tri-state classification."""
+        if self.arm_model is None:
+            raise RuntimeError("ARM mode expects arm_model to be initialized.")
+
+        logits = self.arm_model(img_emb, lang_emb, state, lengths, scheme=scheme)
+        batch_size, seq_len, num_classes = logits.shape
+        if num_classes != 3:
+            raise ValueError(f"ARM tri-state logits should have 3 classes, got {num_classes}")
+
+        valid_mask = torch.arange(seq_len, device=lengths.device).unsqueeze(0) < lengths.unsqueeze(1)
+        logits_valid = logits[valid_mask]
+        targets_valid = advantage_targets[valid_mask]
+
+        if logits_valid.numel() == 0:
+            adv_loss = torch.tensor(0.0, device=logits.device)
+        else:
+            adv_loss = F.cross_entropy(logits_valid, targets_valid, reduction="mean")
+
+        return {
+            "adv_loss": adv_loss,
+            "total_loss": adv_loss * float(self.config.arm_loss_weight),
+        }
+
     def forward(self, batch):
         """
-        Forward pass for SARM reward model training.
+        Forward pass for reward model training.
 
-        Uses stage+tau target format where:
-        - Integer part = stage index
-        - Fractional part = within-stage progress (tau)
-
-        Training uses 75%/25% GT/predicted stage conditioning.
+        - reward_mode="sarm": stage+tau supervision (original SARM)
+        - reward_mode="arm": tri-state advantage supervision (ARM variant)
 
         Args:
             batch: Dictionary with 'observation' containing:
@@ -754,33 +1027,76 @@ class SARMRewardModel(PreTrainedPolicy):
         output_dict = {}
         total_loss = torch.tensor(0.0, device=self.device)
 
-        # Sparse training (always)
-        sparse_targets = observation.get("sparse_targets")
-        if sparse_targets is None:
-            # Try legacy format
-            sparse_targets = observation.get("targets")
-        if sparse_targets is None:
-            raise ValueError("sparse_targets (or targets) is required for SARM training")
-        sparse_targets = sparse_targets.to(self.device)
-
-        sparse_result = self._train_step(
-            img_emb, text_features, state_features, lengths, sparse_targets, scheme="sparse"
-        )
-        output_dict["sparse_stage_loss"] = sparse_result["stage_loss"].item()
-        output_dict["sparse_subtask_loss"] = sparse_result["subtask_loss"].item()
-        total_loss = total_loss + sparse_result["total_loss"]
-
-        # Dense training (if dual mode)
-        if self.config.uses_dual_heads:
-            dense_targets = observation.get("dense_targets")
-            if dense_targets is not None:
-                dense_targets = dense_targets.to(self.device)
-                dense_result = self._train_step(
-                    img_emb, text_features, state_features, lengths, dense_targets, scheme="dense"
+        if self.reward_mode == "arm":
+            sparse_adv_targets = observation.get("sparse_advantage_targets")
+            if sparse_adv_targets is None:
+                sparse_targets = observation.get("sparse_targets", observation.get("targets"))
+                if sparse_targets is None:
+                    raise ValueError(
+                        "ARM mode requires sparse_advantage_targets or sparse_targets/targets as fallback."
+                    )
+                sparse_adv_targets = self._progress_targets_to_advantage_targets(
+                    sparse_targets.to(self.device), lengths=lengths, scheme="sparse"
                 )
-                output_dict["dense_stage_loss"] = dense_result["stage_loss"].item()
-                output_dict["dense_subtask_loss"] = dense_result["subtask_loss"].item()
-                total_loss = total_loss + dense_result["total_loss"]
+            else:
+                sparse_adv_targets = sparse_adv_targets.to(self.device).long()
+
+            sparse_result = self._train_step_arm(
+                img_emb,
+                text_features,
+                state_features,
+                lengths,
+                sparse_adv_targets,
+                scheme="sparse",
+            )
+            output_dict["sparse_adv_loss"] = sparse_result["adv_loss"].item()
+            total_loss = total_loss + sparse_result["total_loss"]
+
+            if self.config.uses_dual_heads:
+                dense_adv_targets = observation.get("dense_advantage_targets")
+                if dense_adv_targets is None:
+                    dense_targets = observation.get("dense_targets")
+                    if dense_targets is not None:
+                        dense_adv_targets = self._progress_targets_to_advantage_targets(
+                            dense_targets.to(self.device), lengths=lengths, scheme="dense"
+                        )
+                if dense_adv_targets is not None:
+                    dense_adv_targets = dense_adv_targets.to(self.device).long()
+                    dense_result = self._train_step_arm(
+                        img_emb,
+                        text_features,
+                        state_features,
+                        lengths,
+                        dense_adv_targets,
+                        scheme="dense",
+                    )
+                    output_dict["dense_adv_loss"] = dense_result["adv_loss"].item()
+                    total_loss = total_loss + dense_result["total_loss"]
+        else:
+            sparse_targets = observation.get("sparse_targets")
+            if sparse_targets is None:
+                sparse_targets = observation.get("targets")
+            if sparse_targets is None:
+                raise ValueError("sparse_targets (or targets) is required for SARM training")
+            sparse_targets = sparse_targets.to(self.device)
+
+            sparse_result = self._train_step(
+                img_emb, text_features, state_features, lengths, sparse_targets, scheme="sparse"
+            )
+            output_dict["sparse_stage_loss"] = sparse_result["stage_loss"].item()
+            output_dict["sparse_subtask_loss"] = sparse_result["subtask_loss"].item()
+            total_loss = total_loss + sparse_result["total_loss"]
+
+            if self.config.uses_dual_heads:
+                dense_targets = observation.get("dense_targets")
+                if dense_targets is not None:
+                    dense_targets = dense_targets.to(self.device)
+                    dense_result = self._train_step(
+                        img_emb, text_features, state_features, lengths, dense_targets, scheme="dense"
+                    )
+                    output_dict["dense_stage_loss"] = dense_result["stage_loss"].item()
+                    output_dict["dense_subtask_loss"] = dense_result["subtask_loss"].item()
+                    total_loss = total_loss + dense_result["total_loss"]
 
         output_dict["total_loss"] = total_loss.item()
         return total_loss, output_dict

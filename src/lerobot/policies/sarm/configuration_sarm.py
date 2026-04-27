@@ -49,6 +49,7 @@ class SARMConfig(PreTrainedConfig):
     """
 
     annotation_mode: str = "single_stage"  # "single_stage", "dense_only", or "dual"
+    reward_mode: str = "sarm"  # "sarm" (stage+tau) or "arm" (tri-state advantage)
     n_obs_steps: int = 8  # Number of observation history steps
     frame_gap: int = 30  # Frame gap between frames (at 30 fps = 1 second)
     max_rewind_steps: int = 4  # Maximum rewind steps for temporal augmentation
@@ -69,6 +70,12 @@ class SARMConfig(PreTrainedConfig):
     clip_batch_size: int = 64
     dropout: float = 0.1
     stage_loss_weight: float = 1.0  # Weight for stage classification loss when using subtask annotations
+    arm_loss_weight: float = 1.0  # Weight for ARM tri-state classification loss
+    arm_window_size: int = 5  # Local temporal window size for MIMO advantage prediction
+    arm_label_horizon: int = 1  # Frames ahead for building tri-state labels from progress deltas
+    arm_progress_scale: float = 4.0  # Scale used when integrating advantage into [0, 1] progress
+    advantage_positive_threshold: float = 0.01  # delta > threshold => progressive
+    advantage_negative_threshold: float = -0.01  # delta < threshold => regressive
 
     rewind_probability: float = 0.8
     language_perturbation_probability: float = 0.2
@@ -115,6 +122,8 @@ class SARMConfig(PreTrainedConfig):
             raise ValueError(
                 f"annotation_mode must be 'single_stage', 'dense_only', or 'dual', got {self.annotation_mode}"
             )
+        if self.reward_mode not in ["sarm", "arm"]:
+            raise ValueError(f"reward_mode must be 'sarm' or 'arm', got {self.reward_mode}")
 
         if self.annotation_mode == "single_stage":
             # Use task description as stage name, full episode as one stage
@@ -167,6 +176,14 @@ class SARMConfig(PreTrainedConfig):
         if self.max_rewind_steps >= self.n_obs_steps:
             raise ValueError(
                 f"max_rewind_steps ({self.max_rewind_steps}) must be less than n_obs_steps ({self.n_obs_steps})"
+            )
+        if self.arm_window_size < 1:
+            raise ValueError(f"arm_window_size must be >= 1, got {self.arm_window_size}")
+        if self.arm_label_horizon < 1:
+            raise ValueError(f"arm_label_horizon must be >= 1, got {self.arm_label_horizon}")
+        if self.advantage_negative_threshold >= self.advantage_positive_threshold:
+            raise ValueError(
+                "advantage_negative_threshold must be smaller than advantage_positive_threshold"
             )
         if self.num_sparse_stages < 1:
             raise ValueError(f"num_sparse_stages must be at least 1, got {self.num_sparse_stages}")

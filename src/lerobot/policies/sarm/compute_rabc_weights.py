@@ -675,6 +675,36 @@ def interpolate_progress(
     return out.astype(np.float32)
 
 
+def compute_advantage_from_progress(
+    progress: np.ndarray,
+    horizon: int,
+    positive_threshold: float,
+    negative_threshold: float,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Compute per-frame advantage deltas and tri-state labels from progress."""
+    n = len(progress)
+    deltas = np.full(n, np.nan, dtype=np.float32)
+    labels = np.full(n, 1, dtype=np.int8)  # 0=regressive, 1=stagnant, 2=progressive
+    if n == 0:
+        return deltas, labels
+
+    for idx in range(n):
+        if not np.isfinite(progress[idx]):
+            continue
+        future_idx = min(idx + horizon, n - 1)
+        if not np.isfinite(progress[future_idx]):
+            continue
+        delta = float(progress[future_idx] - progress[idx])
+        deltas[idx] = delta
+        if delta > positive_threshold:
+            labels[idx] = 2
+        elif delta < negative_threshold:
+            labels[idx] = 0
+        else:
+            labels[idx] = 1
+    return deltas, labels
+
+
 def compute_sarm_progress(
     dataset_repo_id: str,
     reward_model_path: str,
@@ -686,6 +716,9 @@ def compute_sarm_progress(
     stride: int = 1,
     save_mp4: bool = False,
     mp4_fps: int = 20,
+    advantage_horizon: int = 1,
+    advantage_positive_threshold: float = 0.01,
+    advantage_negative_threshold: float = -0.01,
 ):
     """
     Compute SARM progress predictions for all frames in a dataset.
@@ -699,8 +732,13 @@ def compute_sarm_progress(
         num_visualizations: Number of episodes to visualize (0 to skip)
         output_dir: Directory to save visualizations
         stride: Compute progress every N frames, interpolate the rest (default: 1 = every frame)
+        advantage_horizon: Frames ahead for advantage delta labels
+        advantage_positive_threshold: Delta threshold for progressive labels
+        advantage_negative_threshold: Delta threshold for regressive labels
     """
     dataset, reward_model, preprocess = load_sarm_resources(dataset_repo_id, reward_model_path, device)
+    if advantage_horizon < 1:
+        raise ValueError(f"advantage_horizon must be >= 1, got {advantage_horizon}")
 
     # Set preprocessor to eval mode to disable augmentations
     if hasattr(preprocess, "eval"):
@@ -725,6 +763,7 @@ def compute_sarm_progress(
     all_indices = []
     all_episode_indices = []
     all_frame_indices = []
+    all_episode_lengths = []
     all_progress_sparse = [] if compute_sparse else None
     all_progress_dense = [] if compute_dense else None
 
@@ -736,6 +775,7 @@ def compute_sarm_progress(
         ep = dataset.meta.episodes[episode_idx]
         ep_start = ep["dataset_from_index"]
         ep_end = ep["dataset_to_index"]
+        ep_len = ep_end - ep_start
 
         # Get task description
         task = dataset[ep_start].get("task", "perform the task")
@@ -847,6 +887,7 @@ def compute_sarm_progress(
             all_indices.append(frame_idx)
             all_episode_indices.append(episode_idx)
             all_frame_indices.append(local_idx)
+            all_episode_lengths.append(ep_len)
             if compute_sparse:
                 if stride > 1 and len(computed_indices) > 1:
                     all_progress_sparse.append(float(interp_sparse[i]))
@@ -867,6 +908,7 @@ def compute_sarm_progress(
         "index": np.array(all_indices, dtype=np.int64),
         "episode_index": np.array(all_episode_indices, dtype=np.int64),
         "frame_index": np.array(all_frame_indices, dtype=np.int64),
+        "episode_length": np.array(all_episode_lengths, dtype=np.int64),
     }
     if compute_sparse:
         table_data["progress_sparse"] = np.array(all_progress_sparse, dtype=np.float32)
@@ -876,10 +918,38 @@ def compute_sarm_progress(
     # Sort by index
     df = pa.table(table_data).to_pandas()
     df = df.sort_values("index").reset_index(drop=True)
+
+    # Add advantage deltas + tri-state labels for each available progress head.
+    for progress_col, delta_col, label_col in [
+        ("progress_sparse", "advantage_delta_sparse", "advantage_label_sparse"),
+        ("progress_dense", "advantage_delta_dense", "advantage_label_dense"),
+    ]:
+        if progress_col not in df.columns:
+            continue
+        df[delta_col] = np.nan
+        df[label_col] = 1  # stagnant
+        for episode_idx, group in df.groupby("episode_index", sort=False):
+            deltas, labels = compute_advantage_from_progress(
+                group[progress_col].to_numpy(dtype=np.float32),
+                horizon=advantage_horizon,
+                positive_threshold=advantage_positive_threshold,
+                negative_threshold=advantage_negative_threshold,
+            )
+            df.loc[group.index, delta_col] = deltas
+            df.loc[group.index, label_col] = labels.astype(np.int8)
+
     final_table = pa.Table.from_pandas(df, preserve_index=False)
 
     # Add metadata with reward model path
-    metadata = {b"reward_model_path": reward_model_path.encode()}
+    metadata = {
+        b"reward_model_path": reward_model_path.encode(),
+        b"reward_mode": str(getattr(reward_model.config, "reward_mode", "sarm")).encode(),
+        b"head_mode": str(head_mode).encode(),
+        b"stride": str(stride).encode(),
+        b"advantage_horizon": str(advantage_horizon).encode(),
+        b"advantage_positive_threshold": str(advantage_positive_threshold).encode(),
+        b"advantage_negative_threshold": str(advantage_negative_threshold).encode(),
+    }
     final_table = final_table.replace_schema_metadata(metadata)
 
     # Determine output path
@@ -1015,6 +1085,24 @@ Examples:
         default=20,
         help="FPS for exported prediction MP4 videos (default: 20)",
     )
+    parser.add_argument(
+        "--advantage-horizon",
+        type=int,
+        default=1,
+        help="Frames ahead used to compute advantage deltas/labels in parquet (default: 1)",
+    )
+    parser.add_argument(
+        "--advantage-positive-threshold",
+        type=float,
+        default=0.01,
+        help="Delta threshold for progressive tri-state labels (default: 0.01)",
+    )
+    parser.add_argument(
+        "--advantage-negative-threshold",
+        type=float,
+        default=-0.01,
+        help="Delta threshold for regressive tri-state labels (default: -0.01)",
+    )
 
     args = parser.parse_args()
 
@@ -1067,6 +1155,9 @@ Examples:
         stride=args.stride,
         save_mp4=args.save_mp4,
         mp4_fps=args.mp4_fps,
+        advantage_horizon=args.advantage_horizon,
+        advantage_positive_threshold=args.advantage_positive_threshold,
+        advantage_negative_threshold=args.advantage_negative_threshold,
     )
 
     print(f"\nSARM progress values saved to: {output_path}")

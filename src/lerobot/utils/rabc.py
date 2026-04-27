@@ -62,6 +62,11 @@ class RABCWeights:
         epsilon: float = 1e-6,
         fallback_weight: float = 1.0,
         device: torch.device = None,
+        weighting_mode: str = "rabc",
+        length_adaptive_gain: bool = False,
+        awbc_ref_length: float | None = None,
+        gain_clip_min: float = 0.25,
+        gain_clip_max: float = 4.0,
     ):
         self.progress_path = resolve_hf_path(progress_path)
         self.chunk_size = chunk_size
@@ -70,15 +75,21 @@ class RABCWeights:
         self.epsilon = epsilon
         self.fallback_weight = fallback_weight
         self.device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.weighting_mode = weighting_mode.lower()
+        if self.weighting_mode not in {"rabc", "awbc"}:
+            raise ValueError(f"weighting_mode must be 'rabc' or 'awbc', got {weighting_mode}")
+        self.length_adaptive_gain = bool(length_adaptive_gain or self.weighting_mode == "awbc")
+        self.gain_clip_min = float(gain_clip_min)
+        self.gain_clip_max = float(gain_clip_max)
+        if self.gain_clip_min <= 0 or self.gain_clip_max <= 0:
+            raise ValueError("gain_clip_min and gain_clip_max must be > 0")
+        if self.gain_clip_min > self.gain_clip_max:
+            raise ValueError("gain_clip_min must be <= gain_clip_max")
 
-        # Determine progress column name
         self.progress_column = f"progress_{head_mode}"
-
-        # Load progress values
         logging.info(f"Loading SARM progress values from {self.progress_path}")
         self.df = pd.read_parquet(self.progress_path)
 
-        # Check if the requested head mode column exists
         if self.progress_column not in self.df.columns:
             available = [c for c in self.df.columns if c.startswith("progress")]
             raise ValueError(
@@ -86,129 +97,124 @@ class RABCWeights:
             )
 
         logging.info(f"Using progress column: {self.progress_column}")
+        logging.info(
+            f"RA-BC weighting mode: {self.weighting_mode} (length_adaptive_gain={self.length_adaptive_gain})"
+        )
 
-        self.progress_lookup = {}
-        self.episode_lookup = {}
-
+        self.progress_lookup: dict[int, float] = {}
+        self.episode_lookup: dict[int, int] = {}
         for _, row in self.df.iterrows():
             global_idx = int(row["index"])
             progress = row[self.progress_column]
             episode_idx = int(row["episode_index"])
-
             if not np.isnan(progress):
                 self.progress_lookup[global_idx] = float(progress)
             self.episode_lookup[global_idx] = episode_idx
 
-        # Build episode boundaries for delta computation
-        self.episode_boundaries = {}
+        self.episode_boundaries: dict[int, dict[str, int]] = {}
+        self.episode_lengths: dict[int, int] = {}
         for episode_idx in self.df["episode_index"].unique():
             ep_df = self.df[self.df["episode_index"] == episode_idx]
-            self.episode_boundaries[int(episode_idx)] = {
-                "start": int(ep_df["index"].min()),
-                "end": int(ep_df["index"].max()) + 1,
-            }
+            start = int(ep_df["index"].min())
+            end = int(ep_df["index"].max()) + 1
+            self.episode_boundaries[int(episode_idx)] = {"start": start, "end": end}
+            if "episode_length" in ep_df.columns:
+                self.episode_lengths[int(episode_idx)] = int(ep_df["episode_length"].iloc[0])
+            else:
+                self.episode_lengths[int(episode_idx)] = end - start
+
+        if awbc_ref_length is not None:
+            self.ref_length = max(float(awbc_ref_length), 1.0)
+        elif self.episode_lengths:
+            self.ref_length = max(float(np.mean(list(self.episode_lengths.values()))), 1.0)
+        else:
+            self.ref_length = 1.0
 
         logging.info(f"Loaded {len(self.progress_lookup)} frame progress values")
         logging.info(f"Chunk size for delta computation: {chunk_size}")
-
-        # Compute global statistics for weight computation
+        if self.length_adaptive_gain:
+            logging.info(f"AW-BC reference sequence length: {self.ref_length:.2f}")
         self._compute_global_stats()
 
     def _compute_global_stats(self):
-        """Compute global mean and std of progress deltas for weight calculation."""
-        all_deltas = []
-
-        for global_idx, progress in self.progress_lookup.items():
-            episode_idx = self.episode_lookup.get(global_idx)
-            if episode_idx is None:
+        """Compute global mean/std for effective deltas used by weighting."""
+        all_effective_deltas = []
+        all_gains = []
+        for global_idx in self.progress_lookup:
+            delta = self._compute_delta(global_idx)
+            if np.isnan(delta):
                 continue
-
-            bounds = self.episode_boundaries.get(episode_idx)
-            if bounds is None:
+            gain = self._compute_gain(global_idx)
+            effective_delta = delta * gain if self.length_adaptive_gain else delta
+            if np.isnan(effective_delta):
                 continue
+            all_effective_deltas.append(effective_delta)
+            all_gains.append(gain)
 
-            future_idx = global_idx + self.chunk_size
-            if future_idx >= bounds["end"]:
-                # Near end of episode: use last frame's progress
-                future_idx = bounds["end"] - 1
-
-            future_progress = self.progress_lookup.get(future_idx)
-            if future_progress is not None:
-                delta = future_progress - progress
-                all_deltas.append(delta)
-
-        if all_deltas:
-            self.delta_mean = max(np.mean(all_deltas), 0.0)
-            self.delta_std = max(np.std(all_deltas), self.epsilon)
-            logging.info(f"Progress delta stats: mean={self.delta_mean:.4f}, std={self.delta_std:.4f}")
+        if all_effective_deltas:
+            self.delta_mean = max(float(np.mean(all_effective_deltas)), 0.0)
+            self.delta_std = max(float(np.std(all_effective_deltas)), self.epsilon)
+            self.gain_mean = float(np.mean(all_gains)) if all_gains else 1.0
+            logging.info(
+                f"Effective delta stats: mean={self.delta_mean:.4f}, std={self.delta_std:.4f}, "
+                f"mean_gain={self.gain_mean:.4f}"
+            )
         else:
             self.delta_mean = 0.0
             self.delta_std = self.epsilon
+            self.gain_mean = 1.0
             logging.warning("No valid progress deltas found, using default stats")
 
     def compute_batch_weights(self, batch: dict) -> tuple[torch.Tensor, dict]:
-        """
-        Compute RA-BC weights for a batch.
-
-        For each sample:
-        1. Get progress at current frame
-        2. Get progress at frame + chunk_size (within same episode)
-        3. Compute delta = future_progress - current_progress
-        4. Compute weight using paper Eq. 8-9
-
-        Args:
-            batch: Training batch containing "index" key with global frame indices
-
-        Returns:
-            Tuple of:
-            - Weights tensor (batch_size,) normalized to sum to batch_size
-            - Stats dict with raw_mean_weight, num_zero_weight, num_full_weight
-        """
+        """Compute RA-BC/AW-BC weights for a batch."""
         indices = batch.get("index")
         if indices is None:
             logging.warning("RA-BC: Batch missing 'index' key, using uniform weights")
             batch_size = self._get_batch_size(batch)
-            return torch.ones(batch_size, device=self.device), {"raw_mean_weight": 1.0}
+            ones = torch.ones(batch_size, device=self.device)
+            return ones, {"raw_mean_weight": 1.0, "raw_mean_gain": 1.0}
 
-        # Convert to list of ints
         if isinstance(indices, torch.Tensor):
             indices = indices.cpu().numpy().tolist()
         elif isinstance(indices, np.ndarray):
             indices = indices.tolist()
 
-        # Compute deltas and weights for each sample
-        deltas = []
+        gains = []
+        effective_deltas = []
         for idx in indices:
-            idx = int(idx)
-            delta = self._compute_delta(idx)
-            deltas.append(delta)
+            global_idx = int(idx)
+            delta = self._compute_delta(global_idx)
+            gain = self._compute_gain(global_idx)
+            gains.append(gain)
+            if np.isnan(delta):
+                effective_deltas.append(np.nan)
+            else:
+                effective_deltas.append(delta * gain if self.length_adaptive_gain else delta)
 
-        deltas = np.array(deltas, dtype=np.float32)
+        effective_deltas = np.array(effective_deltas, dtype=np.float32)
+        gains = np.array(gains, dtype=np.float32)
+        weights = self._compute_weights(effective_deltas)
 
-        # Compute weights from deltas
-        weights = self._compute_weights(deltas)
-
-        # Compute stats before normalization for logging
         raw_mean_weight = float(np.nanmean(weights))
         num_zero_weight = int(np.sum(weights == 0))
         num_full_weight = int(np.sum(weights == 1.0))
+        valid_gain = gains[~np.isnan(gains)]
+        raw_mean_gain = float(np.mean(valid_gain)) if valid_gain.size > 0 else 1.0
         batch_stats = {
             "raw_mean_weight": raw_mean_weight,
             "num_zero_weight": num_zero_weight,
             "num_full_weight": num_full_weight,
+            "raw_mean_gain": raw_mean_gain,
         }
 
         weights = torch.tensor(weights, device=self.device, dtype=torch.float32)
-
-        # Normalize to sum to batch_size
         batch_size = len(weights)
         weight_sum = weights.sum() + self.epsilon
         weights = weights * batch_size / weight_sum
-
         return weights, batch_stats
 
     def _compute_delta(self, global_idx: int) -> float:
-        """Compute progress delta for a single frame."""
+        """Compute raw progress delta for a single frame."""
         current_progress = self.progress_lookup.get(global_idx)
         if current_progress is None:
             return np.nan
@@ -221,54 +227,44 @@ class RABCWeights:
         if bounds is None:
             return np.nan
 
-        future_idx = global_idx + self.chunk_size  # Δ = chunk_size
+        future_idx = global_idx + self.chunk_size
         if future_idx >= bounds["end"]:
-            # Near end of episode: use last frame's progress instead
             future_idx = bounds["end"] - 1
 
         future_progress = self.progress_lookup.get(future_idx)
         if future_progress is None:
             return np.nan
-
         return future_progress - current_progress
 
+    def _compute_gain(self, global_idx: int) -> float:
+        """Compute AW-BC length-adaptive gain for a frame."""
+        if not self.length_adaptive_gain:
+            return 1.0
+        episode_idx = self.episode_lookup.get(global_idx)
+        if episode_idx is None:
+            return 1.0
+        seq_len = float(self.episode_lengths.get(episode_idx, 0))
+        if seq_len <= 0:
+            return 1.0
+        gain = seq_len / max(self.ref_length, self.epsilon)
+        return float(np.clip(gain, self.gain_clip_min, self.gain_clip_max))
+
     def _compute_weights(self, deltas: np.ndarray) -> np.ndarray:
-        """
-        Compute RA-BC weights from progress deltas.
-
-        Following paper Eq. 8-9:
-        - Soft weight: ˜wi = clip((ri − (µ − 2σ)) / (4σ + ε), 0, 1)
-        - Final weight: wi = 1{ri > κ} + 1{0 ≤ ri ≤ κ}˜wi
-
-        Returns:
-            Array of weights
-        """
+        """Compute sample weights from effective progress deltas (Eq. 8-9)."""
         valid_mask = ~np.isnan(deltas)
-
-        # Compute soft weights using global statistics
         lower_bound = self.delta_mean - 2 * self.delta_std
         soft_weights = (deltas - lower_bound) / (4 * self.delta_std + self.epsilon)
         soft_weights = np.clip(soft_weights, 0.0, 1.0)
 
-        # Apply paper's Eq. 9
         weights = np.zeros_like(deltas, dtype=np.float32)
-
-        # High quality: ri > kappa → weight = 1
         high_quality_mask = deltas > self.kappa
         weights[high_quality_mask] = 1.0
-
-        # Moderate quality: 0 <= ri <= kappa → weight = soft_weight
         moderate_mask = (deltas >= 0) & (deltas <= self.kappa)
         weights[moderate_mask] = soft_weights[moderate_mask]
-
-        # Negative progress: ri < 0 → weight = 0 (already 0)
-        # Invalid (NaN): use fallback weight
         weights[~valid_mask] = self.fallback_weight
-
         return weights
 
     def _get_batch_size(self, batch: dict) -> int:
-        """Determine batch size from batch."""
         for key in ["action", "index"]:
             if key in batch:
                 val = batch[key]
@@ -277,7 +273,6 @@ class RABCWeights:
         return 1
 
     def get_stats(self) -> dict:
-        """Get statistics."""
         return {
             "num_frames": len(self.progress_lookup),
             "chunk_size": self.chunk_size,
@@ -285,4 +280,8 @@ class RABCWeights:
             "delta_mean": self.delta_mean,
             "delta_std": self.delta_std,
             "kappa": self.kappa,
+            "weighting_mode": self.weighting_mode,
+            "length_adaptive_gain": self.length_adaptive_gain,
+            "ref_length": self.ref_length,
+            "gain_mean": self.gain_mean,
         }

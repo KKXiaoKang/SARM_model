@@ -76,6 +76,11 @@ class TrainPipelineConfig(HubMixin):
     rabc_kappa: float = 0.01  # Hard threshold for high-quality samples
     rabc_epsilon: float = 1e-6  # Small constant for numerical stability
     rabc_head_mode: str | None = "sparse"  # For dual-head models: "sparse" or "dense"
+    rabc_weighting_mode: str = "rabc"  # "rabc" (default) or "awbc" (length-adaptive gain)
+    rabc_length_adaptive_gain: bool = False  # Apply AW-BC length-adaptive gain
+    rabc_awbc_ref_length: float | None = None  # Optional fixed reference sequence length
+    rabc_gain_clip_min: float = 0.25  # Lower clip for length-adaptive gain
+    rabc_gain_clip_max: float = 4.0  # Upper clip for length-adaptive gain
 
     # Rename map for the observation to override the image and state keys
     rename_map: dict[str, str] = field(default_factory=dict)
@@ -150,6 +155,13 @@ class TrainPipelineConfig(HubMixin):
                 self.rabc_progress_path = str(Path(self.dataset.root) / "sarm_progress.parquet")
             else:
                 self.rabc_progress_path = f"hf://datasets/{repo_id}/sarm_progress.parquet"
+
+        if self.rabc_weighting_mode not in {"rabc", "awbc"}:
+            raise ValueError("rabc_weighting_mode must be 'rabc' or 'awbc'")
+        if self.rabc_gain_clip_min <= 0 or self.rabc_gain_clip_max <= 0:
+            raise ValueError("rabc_gain_clip_min and rabc_gain_clip_max must be > 0")
+        if self.rabc_gain_clip_min > self.rabc_gain_clip_max:
+            raise ValueError("rabc_gain_clip_min must be <= rabc_gain_clip_max")
 
     @classmethod
     def __get_path_fields__(cls) -> list[str]:

@@ -424,6 +424,22 @@ The weighting follows **Equations 8-9** from the paper:
 - **Soft weight**: `w̃_i = clip((r_i − (μ − 2σ)) / (4σ + ε), 0, 1)`
 - **Final weight**: `w_i = 𝟙{r_i > κ} + 𝟙{0 ≤ r_i ≤ κ} × w̃_i`
 
+### ARM Upgrade: Tri-state Advantage + AW-BC
+
+This implementation also supports an ARM-style extension:
+
+1. **Tri-state advantage labels** per frame:
+   - `0`: Regressive
+   - `1`: Stagnant
+   - `2`: Progressive
+2. **AW-BC weighting** (optional): applies a length-adaptive gain so effective deltas become:
+
+```
+ΔG_t = (P_{t+H} - P_t) * (L_seq / L_ref)
+```
+
+Where `L_seq` is episode length and `L_ref` is dataset-level reference length.
+
 ### Step 5a: Compute SARM Progress Values
 
 First, run the SARM model on all frames in your dataset to compute progress values:
@@ -433,14 +449,14 @@ python src/lerobot/policies/sarm/compute_rabc_weights.py \
   --dataset-repo-id your-username/your-dataset \
   --reward-model-path your-username/sarm-model \
   --head-mode sparse \
-  --num-visualizations 5 \
-  --push-to-hub
+  --num-visualizations 5
 ```
 
 This script:
 
 - Processes all frames and computes progress values
 - Saves progress values to a parquet file next to the dataset on disk (defaults to `<dataset_root>/sarm_progress.parquet`)
+- Adds per-frame advantage deltas and tri-state labels
 - Generates visualizations of the first N episodes (default: 5)
 
 **Arguments:**
@@ -452,6 +468,9 @@ This script:
 | `--device`             | Device for inference                                           | `cuda`     |
 | `--visualize-only`     | Only visualize predictions (no RA-BC computation)              | `false`    |
 | `--num-visualizations` | Number of episodes to visualize (default: 5, set to 0 to skip) | `5`        |
+| `--advantage-horizon`  | Frames ahead for advantage delta/label computation             | `1`        |
+| `--advantage-positive-threshold` | Delta threshold for progressive label                  | `0.01`     |
+| `--advantage-negative-threshold` | Delta threshold for regressive label                   | `-0.01`    |
 
 **Output format** (`sarm_progress.parquet`):
 
@@ -460,8 +479,13 @@ This script:
 | `index`           | Global frame index in dataset                  |
 | `episode_index`   | Episode number                                 |
 | `frame_index`     | Local frame index within episode               |
+| `episode_length`  | Episode length (for AW-BC length-adaptive gain) |
 | `progress_sparse` | Sparse head progress value [0, 1]              |
 | `progress_dense`  | Dense head progress value [0, 1] (if computed) |
+| `advantage_delta_sparse` | Sparse progress delta using horizon `H`   |
+| `advantage_label_sparse` | Sparse tri-state label (0/1/2)            |
+| `advantage_delta_dense`  | Dense progress delta (if dense computed)   |
+| `advantage_label_dense`  | Dense tri-state label (if dense computed)  |
 
 ### Step 5b: Train Policy with RA-BC
 
@@ -474,7 +498,24 @@ lerobot-train \
   --use_rabc=true \
   --rabc_head_mode=sparse \
   --rabc_kappa=0.01 \
+  --rabc_weighting_mode=rabc \
   --output_dir=outputs/train/policy_rabc \
+  --batch_size=32 \
+  --steps=40000
+```
+
+Example with **AW-BC** (length-adaptive gain):
+
+```bash
+lerobot-train \
+  --dataset.repo_id=your-username/your-dataset \
+  --policy.type=pi0 \
+  --use_rabc=true \
+  --rabc_head_mode=sparse \
+  --rabc_weighting_mode=awbc \
+  --rabc_length_adaptive_gain=true \
+  --rabc_kappa=0.01 \
+  --output_dir=outputs/train/policy_awbc \
   --batch_size=32 \
   --steps=40000
 ```
@@ -494,6 +535,9 @@ The training script automatically:
 | `--rabc_progress_path` | Path to progress parquet file (auto-detected from dataset) | `sarm_progress.parquet` in dataset |
 | `--rabc_head_mode`     | Which SARM head's progress to use: `sparse` or `dense`     | `sparse`                           |
 | `--rabc_kappa`         | Threshold κ for high-quality samples                       | `0.01`                             |
+| `--rabc_weighting_mode` | Weighting backend: `rabc` or `awbc`                       | `rabc`                             |
+| `--rabc_length_adaptive_gain` | Enable length-adaptive gain for AW-BC               | `false`                            |
+| `--rabc_awbc_ref_length` | Optional fixed `L_ref` (otherwise auto-estimated)        | `null`                             |
 
 ### Tuning RA-BC Kappa
 
@@ -516,6 +560,7 @@ Monitor these WandB metrics during training:
 | `rabc_mean_weight` | 0.3 - 0.8     | ≈ 1.0 means kappa too low |
 | `rabc_delta_mean`  | > 0           | Should be positive        |
 | `rabc_delta_std`   | > 0           | Variance in data quality  |
+| `rabc_mean_gain`   | task-dependent| Very high means long episodes dominate |
 
 **If `rabc_mean_weight ≈ 1.0`:** Your kappa is too low. Most samples have `delta > kappa` and bypass the soft-weighting entirely. RA-BC becomes equivalent to vanilla BC.
 
@@ -541,6 +586,12 @@ The default `kappa=0.01` was tuned for the paper's T-shirt folding task (~90s ep
 
 If your dataset is already high quality (consistent progress across all demonstrations), RA-BC won't provide much benefit since there's nothing to filter.
 
+### ARM + AW-BC Practical Notes
+
+1. Use `--policy.reward_mode=arm` when training the reward model (Step 3) to enable tri-state ARM supervision.
+2. Keep `rabc_weighting_mode=rabc` as a baseline, then enable `awbc` to test robustness on variable-length DAgger data.
+3. If `rabc_mean_gain` is unstable, set `--rabc_awbc_ref_length` explicitly and tune gain clipping.
+
 ### Multi-GPU Training with RA-BC
 
 ```bash
@@ -552,6 +603,7 @@ accelerate launch \
   --policy.type=pi0 \
   --use_rabc=true \
   --rabc_kappa=0.01 \
+  --rabc_weighting_mode=rabc \
   --output_dir=outputs/train/policy_rabc \
   --batch_size=32 \
   --steps=40000

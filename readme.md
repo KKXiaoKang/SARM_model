@@ -166,3 +166,5 @@ PYTHONPATH=src python -m lerobot.policies.sarm.compute_rabc_weights \
   --mp4-fps 20 
 ```
 
+## Step 5: Train Policy with RA-BC
+### 5a: Compute SARM Progress Values

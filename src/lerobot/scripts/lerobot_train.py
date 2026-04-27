@@ -118,6 +118,8 @@ def update_policy(
             output_dict["rabc_mean_weight"] = rabc_batch_stats["raw_mean_weight"]
             output_dict["rabc_num_zero_weight"] = rabc_batch_stats["num_zero_weight"]
             output_dict["rabc_num_full_weight"] = rabc_batch_stats["num_full_weight"]
+            if "raw_mean_gain" in rabc_batch_stats:
+                output_dict["rabc_mean_gain"] = rabc_batch_stats["raw_mean_gain"]
         else:
             loss, output_dict = policy.forward(batch)
 
@@ -337,6 +339,11 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
             kappa=getattr(cfg, "rabc_kappa", 0.01),
             epsilon=getattr(cfg, "rabc_epsilon", 1e-6),
             device=device,
+            weighting_mode=getattr(cfg, "rabc_weighting_mode", "rabc"),
+            length_adaptive_gain=getattr(cfg, "rabc_length_adaptive_gain", False),
+            awbc_ref_length=getattr(cfg, "rabc_awbc_ref_length", None),
+            gain_clip_min=getattr(cfg, "rabc_gain_clip_min", 0.25),
+            gain_clip_max=getattr(cfg, "rabc_gain_clip_max", 4.0),
         )
 
     step = 0  # number of policy updates (forward + backward + optim)
@@ -471,6 +478,7 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
                             "rabc_delta_mean": rabc_stats["delta_mean"],
                             "rabc_delta_std": rabc_stats["delta_std"],
                             "rabc_num_frames": rabc_stats["num_frames"],
+                            "rabc_gain_mean": rabc_stats.get("gain_mean", 1.0),
                         }
                     )
                 wandb_logger.log_dict(wandb_log_dict, step)

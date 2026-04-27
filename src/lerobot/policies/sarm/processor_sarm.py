@@ -68,6 +68,7 @@ from .sarm_utils import (
     apply_rewind_augmentation,
     compute_absolute_indices,
     find_stage_and_tau,
+    normalize_stage_tau,
     pad_state_to_max_dim,
 )
 
@@ -88,6 +89,10 @@ def _clip_model_features_to_tensor(features: torch.Tensor | Any) -> torch.Tensor
 
 class SARMEncodingProcessorStep(ProcessorStep):
     """ProcessorStep that encodes images and text with CLIP and generates stage and progress labels for SARM."""
+
+    REGRESSIVE_LABEL = 0
+    STAGNANT_LABEL = 1
+    PROGRESSIVE_LABEL = 2
 
     def __init__(
         self,
@@ -201,6 +206,45 @@ class SARMEncodingProcessorStep(ProcessorStep):
             episodes_df.loc[ep_idx, col("subtask_start_frames")],
             episodes_df.loc[ep_idx, col("subtask_end_frames")],
         )
+
+    def _normalize_progress_targets(self, targets: torch.Tensor, annotation_type: str) -> torch.Tensor:
+        """Convert stage+tau targets into normalized [0, 1] progress."""
+        subtask_names, temporal_props = self._get_annotation_config(annotation_type)
+        if not subtask_names:
+            return targets.clamp(0.0, 1.0)
+
+        if temporal_props is not None:
+            return normalize_stage_tau(
+                targets,
+                temporal_proportions=temporal_props,
+                subtask_names=subtask_names,
+            )
+
+        return normalize_stage_tau(targets, num_stages=max(1, len(subtask_names)))
+
+    def _compute_advantage_targets(self, progress: torch.Tensor, lengths: torch.Tensor) -> torch.Tensor:
+        """Build tri-state advantage labels from normalized progress deltas."""
+        batch_size, seq_len = progress.shape
+        labels = torch.full((batch_size, seq_len), self.STAGNANT_LABEL, dtype=torch.long)
+        horizon = self.config.arm_label_horizon
+        pos_th = self.config.advantage_positive_threshold
+        neg_th = self.config.advantage_negative_threshold
+
+        for b_idx in range(batch_size):
+            valid_len = int(lengths[b_idx].item())
+            if valid_len <= 0:
+                continue
+            for t_idx in range(valid_len):
+                future_idx = min(t_idx + horizon, valid_len - 1)
+                delta = float(progress[b_idx, future_idx] - progress[b_idx, t_idx])
+                if delta > pos_th:
+                    labels[b_idx, t_idx] = self.PROGRESSIVE_LABEL
+                elif delta < neg_th:
+                    labels[b_idx, t_idx] = self.REGRESSIVE_LABEL
+                else:
+                    labels[b_idx, t_idx] = self.STAGNANT_LABEL
+
+        return labels
 
     def __call__(self, transition: EnvTransition) -> EnvTransition:
         """
@@ -325,6 +369,17 @@ class SARMEncodingProcessorStep(ProcessorStep):
                         frame_indices, episode_indices, lengths, rewind_steps, episodes_df, "sparse"
                     )
                 observation["sparse_targets"] = sparse_targets
+                if self.config.reward_mode == "arm":
+                    if apply_perturbation:
+                        sparse_adv_targets = torch.full(
+                            (batch_size, total_frames),
+                            self.STAGNANT_LABEL,
+                            dtype=torch.long,
+                        )
+                    else:
+                        sparse_progress = self._normalize_progress_targets(sparse_targets, annotation_type="sparse")
+                        sparse_adv_targets = self._compute_advantage_targets(sparse_progress, lengths)
+                    observation["sparse_advantage_targets"] = sparse_adv_targets
 
             # Generate dense targets (for dual mode)
             if self.config.uses_dual_heads and self.dense_temporal_proportions is not None:
@@ -336,6 +391,17 @@ class SARMEncodingProcessorStep(ProcessorStep):
                         frame_indices, episode_indices, lengths, rewind_steps, episodes_df, "dense"
                     )
                 observation["dense_targets"] = dense_targets
+                if self.config.reward_mode == "arm":
+                    if apply_perturbation:
+                        dense_adv_targets = torch.full(
+                            (batch_size, total_frames),
+                            self.STAGNANT_LABEL,
+                            dtype=torch.long,
+                        )
+                    else:
+                        dense_progress = self._normalize_progress_targets(dense_targets, annotation_type="dense")
+                        dense_adv_targets = self._compute_advantage_targets(dense_progress, lengths)
+                    observation["dense_advantage_targets"] = dense_adv_targets
 
         new_transition[TransitionKey.OBSERVATION] = observation
         return new_transition
