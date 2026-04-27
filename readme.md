@@ -76,6 +76,8 @@ pip install lerobot[dataset]
 pip install lerobot[sarm]
 python -m pip install -U qwen-vl-utils
 pip3 install matplotlib 
+pip install httpx[socks]
+pip install accelerate  
 pip install faker
 pip install wandb
 pip install pyarrow
