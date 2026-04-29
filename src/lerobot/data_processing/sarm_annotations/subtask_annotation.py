@@ -59,8 +59,10 @@ python examples/dataset_annotation/subtask_annotation.py \
 import argparse
 import json
 import multiprocessing as mp
+import os
 import random
 import re
+import shutil
 import subprocess
 import tempfile
 import textwrap
@@ -78,6 +80,79 @@ from transformers import AutoProcessor, Qwen3VLMoeForConditionalGeneration
 
 from lerobot.datasets import LeRobotDataset
 from lerobot.utils.io_utils import write_video
+
+
+_FFMPEG_BIN: str | None = None
+_FFMPEG_ENCODERS: set[str] | None = None
+
+
+def _get_ffmpeg_bin() -> str:
+    """Resolve a usable ffmpeg binary, preferring current conda env."""
+    global _FFMPEG_BIN
+    if _FFMPEG_BIN is not None:
+        return _FFMPEG_BIN
+
+    candidates: list[Path] = []
+    conda_prefix = os.environ.get("CONDA_PREFIX")
+    if conda_prefix:
+        candidates.append(Path(conda_prefix) / "bin" / "ffmpeg")
+
+    which_ffmpeg = shutil.which("ffmpeg")
+    if which_ffmpeg:
+        candidates.append(Path(which_ffmpeg))
+
+    for candidate in candidates:
+        if not candidate.exists():
+            continue
+        try:
+            subprocess.run(
+                [str(candidate), "-version"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                check=True,
+            )
+            _FFMPEG_BIN = str(candidate)
+            return _FFMPEG_BIN
+        except Exception:
+            continue
+
+    raise RuntimeError("ffmpeg not found, cannot extract episode segment")
+
+
+def _get_ffmpeg_encoders(ffmpeg_bin: str) -> set[str]:
+    """Return available ffmpeg encoder names."""
+    global _FFMPEG_ENCODERS
+    if _FFMPEG_ENCODERS is not None:
+        return _FFMPEG_ENCODERS
+
+    proc = subprocess.run(
+        [ffmpeg_bin, "-hide_banner", "-encoders"],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    encoders: set[str] = set()
+    for line in proc.stdout.splitlines():
+        parts = line.strip().split()
+        # Typical line format: "V....D libopenh264 OpenH264 H.264 / AVC ..."
+        if len(parts) >= 2 and parts[0].startswith(("V", "A", "S")):
+            encoders.add(parts[1])
+    _FFMPEG_ENCODERS = encoders
+    return encoders
+
+
+def _select_video_encoder_args(ffmpeg_bin: str) -> tuple[list[str], str]:
+    """Choose a supported video encoder and corresponding ffmpeg args."""
+    encoders = _get_ffmpeg_encoders(ffmpeg_bin)
+    if "libx264" in encoders:
+        return ["-c:v", "libx264", "-preset", "ultrafast", "-crf", "23"], "libx264"
+    if "libopenh264" in encoders:
+        return ["-c:v", "libopenh264", "-b:v", "4M"], "libopenh264"
+    if "mpeg4" in encoders:
+        return ["-c:v", "mpeg4", "-q:v", "3"], "mpeg4"
+    raise RuntimeError(
+        f"No supported H.264-like encoder found in ffmpeg. Available encoders: {sorted(list(encoders))[:20]}"
+    )
 
 
 # Pydantic Models for SARM Subtask Annotation
@@ -323,22 +398,21 @@ class VideoAnnotator:
             tmp_path = Path(tmp_file.name)
 
         try:
-            # Check if ffmpeg is available
-            subprocess.run(  # nosec B607
-                ["ffmpeg", "-version"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True
-            )
-        except (subprocess.CalledProcessError, FileNotFoundError) as err:
-            raise RuntimeError("ffmpeg not found, cannot extract episode segment") from err
+            ffmpeg_bin = _get_ffmpeg_bin()
+            encoder_args, encoder_name = _select_video_encoder_args(ffmpeg_bin)
+        except Exception as err:
+            raise RuntimeError(f"ffmpeg setup failed: {err}") from err
 
         try:
             # Calculate duration
             duration = end_timestamp - start_timestamp
 
             print(f"Extracting episode: {start_timestamp:.1f}s-{end_timestamp:.1f}s ({duration:.1f}s)")
+            print(f"Using ffmpeg encoder: {encoder_name}")
 
             # Use ffmpeg to extract segment with minimal quality loss
             cmd = [
-                "ffmpeg",
+                ffmpeg_bin,
                 "-i",
                 str(file_path),
                 "-ss",
@@ -347,18 +421,18 @@ class VideoAnnotator:
                 str(duration),
                 "-r",
                 str(target_fps),
-                "-c:v",
-                "libx264",
-                "-preset",
-                "ultrafast",
-                "-crf",
-                "23",
+                *encoder_args,
                 "-an",
                 "-y",
                 str(tmp_path),
             ]
 
-            subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
+            proc = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
+            if proc.returncode != 0:
+                ffmpeg_err = (proc.stderr or "").strip()
+                if ffmpeg_err:
+                    ffmpeg_err = ffmpeg_err[-500:]
+                raise RuntimeError(f"ffmpeg command failed (code={proc.returncode}): {ffmpeg_err}")
 
             # Verify the output file was created and is not empty
             if not tmp_path.exists() or tmp_path.stat().st_size == 0:

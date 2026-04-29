@@ -72,8 +72,8 @@ conda activate lerobot_dagger
 
 conda install ffmpeg 
 pip3 install -e .
-pip install lerobot[dataset]
-pip install lerobot[sarm]
+pip install 'lerobot[dataset]'
+pip install 'lerobot[sarm]'
 python -m pip install -U qwen-vl-utils
 pip3 install matplotlib 
 pip install httpx[socks]
@@ -81,8 +81,8 @@ pip install accelerate
 pip install faker
 pip install wandb
 pip install pyarrow
-pip install lerobot[dataset]
-pip install lerobot[sarm]
+pip3 install pydantic
+
 ```
 # 整体工作流：
 总体工作流

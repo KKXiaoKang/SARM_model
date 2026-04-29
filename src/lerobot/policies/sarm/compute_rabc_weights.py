@@ -134,6 +134,45 @@ def to_numpy_image(img) -> np.ndarray:
     return img
 
 
+def _resolve_stage_labels(subtask_names: list[str] | None, num_stages: int, reward_mode: str) -> list[str]:
+    """Build display labels that match the prediction stage dimension."""
+    if reward_mode == "arm" and num_stages == 3:
+        return ["Regressive", "Stagnant", "Progressive"]
+    if isinstance(subtask_names, list) and len(subtask_names) == num_stages:
+        return subtask_names
+    return [f"Stage {i + 1}" for i in range(num_stages)]
+
+
+def _episode_signed_advantage_to_progress(signed_adv: np.ndarray, scale: float) -> np.ndarray:
+    """Integrate per-frame ARM signed advantage into an episode-level progress trajectory.
+
+    ARM only predicts local tri-state advantage logits per frame. To draw an
+    episode-level "global progress" curve, we cumulate the signed advantage and
+    normalize by the episode-wide cumulative budget so the curve stays in [0, 1]
+    and (for monotonically progressing episodes) approaches 1 only near the end.
+
+    NOTE: this is a visualization proxy, not a true stage+tau progress target.
+    """
+    del scale  # legacy parameter from the previous sigmoid-based implementation
+    signed_adv = np.asarray(signed_adv, dtype=np.float32)
+    valid_mask = np.isfinite(signed_adv)
+    if not valid_mask.any():
+        return np.full_like(signed_adv, np.nan, dtype=np.float32)
+
+    adv_filled = np.where(valid_mask, signed_adv, 0.0).astype(np.float64)
+    cumulative = np.cumsum(adv_filled)
+    final_value = float(cumulative[-1])
+
+    if abs(final_value) < 1e-6:
+        # Model is essentially undecided across the episode (e.g. mostly Stagnant)
+        # so we cannot derive a meaningful global progress from ARM alone.
+        return np.full_like(signed_adv, np.nan, dtype=np.float32)
+
+    progress = cumulative / final_value
+    progress = np.clip(progress, 0.0, 1.0)
+    return progress.astype(np.float32)
+
+
 def visualize_episode(
     frames, progress_preds, stage_preds, title, output_path, stage_labels, gt_progress=None, gt_stages=None
 ):
@@ -164,12 +203,15 @@ def visualize_episode(
     ax_progress.grid(True, alpha=0.3)
 
     # Stage predictions
+    resolved_stage_labels = (
+        stage_labels if len(stage_labels) == num_stages else [f"Stage {i + 1}" for i in range(num_stages)]
+    )
     ax_stages.stackplot(
         frame_indices,
         *[stage_preds[:, i] for i in range(num_stages)],
         colors=colors,
         alpha=0.8,
-        labels=stage_labels,
+        labels=resolved_stage_labels,
     )
     if gt_stages is not None:
         for change_idx in np.where(np.diff(gt_stages) != 0)[0] + 1:
@@ -191,7 +233,7 @@ def visualize_episode(
         if frame.shape[-1] == 1:
             frame = np.repeat(frame, 3, axis=-1)
         combined[:, i * w : (i + 1) * w] = frame
-        stage_name = stage_labels[np.argmax(stage_preds[idx])][:12]
+        stage_name = resolved_stage_labels[np.argmax(stage_preds[idx])][:12]
         ax_frames.text(
             i * w + w / 2,
             -10,
@@ -439,6 +481,7 @@ def visualize_sarm_predictions(
     state_key = reward_model.config.state_key
     dual_mode = reward_model.config.uses_dual_heads
     device = reward_model.device
+    reward_mode = str(getattr(reward_model.config, "reward_mode", "sarm")).lower()
 
     # Center frame index for bidirectional sampling
     target_idx = reward_model.config.n_obs_steps // 2
@@ -484,15 +527,19 @@ def visualize_sarm_predictions(
         scheme_data = {}
         for scheme in schemes_to_viz:
             num_stages = getattr(reward_model.config, f"num_{scheme}_stages")
+            subtask_names = getattr(reward_model.config, f"{scheme}_subtask_names")
             scheme_data[scheme] = {
                 "viz_progress": np.full(num_frames, np.nan),
+                "viz_signed_adv": np.full(num_frames, np.nan),
                 "viz_stages": np.full((num_frames, num_stages), np.nan),
                 "viz_gt_progress": np.full(num_frames, np.nan),
                 "viz_gt_stages": np.full(num_frames, np.nan),
                 "target_key": f"{scheme}_targets",
                 "num_stages": num_stages,
+                "gt_num_stages": num_stages,
                 "temporal_props": getattr(reward_model.config, f"{scheme}_temporal_proportions"),
-                "subtask_names": getattr(reward_model.config, f"{scheme}_subtask_names"),
+                "subtask_names": subtask_names,
+                "stage_labels": _resolve_stage_labels(subtask_names, num_stages, reward_mode),
             }
 
         if stride > 1:
@@ -537,7 +584,7 @@ def visualize_sarm_predictions(
                         sd["viz_gt_stages"][local_idx] = int(gt_target)
                         sd["viz_gt_progress"][local_idx] = normalize_stage_tau(
                             gt_target,
-                            num_stages=sd["num_stages"],
+                            num_stages=sd["gt_num_stages"],
                             temporal_proportions=sd["temporal_props"],
                             subtask_names=sd["subtask_names"],
                         )
@@ -559,11 +606,38 @@ def visualize_sarm_predictions(
                         stage_probs = stage_probs.cpu().numpy()
 
                     if reward.ndim == 2:
-                        sd["viz_progress"][local_idx] = reward[0, target_idx]
-                        sd["viz_stages"][local_idx] = stage_probs[0, target_idx, :]
+                        frame_reward = float(reward[0, target_idx])
+                        stage_vector = np.asarray(stage_probs[0, target_idx, :], dtype=np.float32)
                     else:
-                        sd["viz_progress"][local_idx] = reward[target_idx]
-                        sd["viz_stages"][local_idx] = stage_probs[target_idx, :]
+                        frame_reward = float(reward[target_idx])
+                        stage_vector = np.asarray(stage_probs[target_idx, :], dtype=np.float32)
+
+                    if sd["viz_stages"].shape[1] != stage_vector.shape[0]:
+                        logging.warning(
+                            "Stage dimension mismatch for %s head (configured=%d, predicted=%d). "
+                            "Updating visualization buffers to predicted dimension.",
+                            scheme,
+                            sd["viz_stages"].shape[1],
+                            stage_vector.shape[0],
+                        )
+                        prev_viz = sd["viz_stages"]
+                        new_viz = np.full((num_frames, stage_vector.shape[0]), np.nan, dtype=np.float32)
+                        copy_cols = min(prev_viz.shape[1], new_viz.shape[1])
+                        if copy_cols > 0:
+                            new_viz[:, :copy_cols] = prev_viz[:, :copy_cols]
+                        sd["viz_stages"] = new_viz
+                        sd["num_stages"] = stage_vector.shape[0]
+                        sd["stage_labels"] = _resolve_stage_labels(
+                            sd["subtask_names"], sd["num_stages"], reward_mode
+                        )
+
+                    sd["viz_stages"][local_idx] = stage_vector
+                    if reward_mode == "arm" and stage_vector.shape[0] >= 3:
+                        sd["viz_signed_adv"][local_idx] = float(stage_vector[2] - stage_vector[0])
+                    elif reward_mode == "arm":
+                        sd["viz_signed_adv"][local_idx] = frame_reward
+                    else:
+                        sd["viz_progress"][local_idx] = frame_reward
 
                 # Clear GPU memory after each frame
                 del processed, video_features, text_features
@@ -573,17 +647,23 @@ def visualize_sarm_predictions(
             torch.cuda.empty_cache()
 
         # Interpolate predictions back to per-frame arrays for smooth visualization.
-        if stride > 1:
-            all_local = np.arange(num_frames)
-            for scheme in schemes_to_viz:
-                sd = scheme_data[scheme]
-
-                valid = np.isfinite(sd["viz_progress"])
-                valid_idx = np.where(valid)[0]
-                if valid_idx.size >= 1:
-                    sd["viz_progress"] = interpolate_progress(
-                        valid_idx, sd["viz_progress"][valid_idx], all_local
-                    )
+        all_local = np.arange(num_frames)
+        arm_progress_scale = float(getattr(reward_model.config, "arm_progress_scale", 1.0))
+        for scheme in schemes_to_viz:
+            sd = scheme_data[scheme]
+            signal = sd["viz_signed_adv"] if reward_mode == "arm" else sd["viz_progress"]
+            valid = np.isfinite(signal)
+            valid_idx = np.where(valid)[0]
+            if valid_idx.size >= 1:
+                if stride > 1:
+                    if reward_mode == "arm":
+                        sd["viz_signed_adv"] = interpolate_progress(
+                            valid_idx, sd["viz_signed_adv"][valid_idx], all_local
+                        )
+                    else:
+                        sd["viz_progress"] = interpolate_progress(
+                            valid_idx, sd["viz_progress"][valid_idx], all_local
+                        )
 
                     stage_interp = np.zeros_like(sd["viz_stages"], dtype=np.float32)
                     for s in range(sd["num_stages"]):
@@ -596,15 +676,24 @@ def visualize_sarm_predictions(
                     nz = row_sums.squeeze(-1) > 0
                     stage_interp[nz] = stage_interp[nz] / row_sums[nz]
                     sd["viz_stages"] = stage_interp
-                else:
-                    # No valid points: keep NaNs/zeros; visualization will be empty.
-                    sd["viz_stages"] = np.nan_to_num(sd["viz_stages"], nan=0.0)
+
+                if reward_mode == "arm":
+                    sd["viz_progress"] = _episode_signed_advantage_to_progress(
+                        sd["viz_signed_adv"], scale=arm_progress_scale
+                    )
+            else:
+                # No valid points: keep NaNs/zeros; visualization will be empty.
+                sd["viz_stages"] = np.nan_to_num(sd["viz_stages"], nan=0.0)
+                if reward_mode == "arm":
+                    sd["viz_progress"] = np.full(num_frames, np.nan, dtype=np.float32)
 
         # Generate visualization for each head
         ordered_viz_frames = [viz_frames[idx] for idx in sorted(display_indices)]
         for scheme in schemes_to_viz:
             sd = scheme_data[scheme]
-            stage_labels = sd["subtask_names"] or [f"Stage {i + 1}" for i in range(sd["num_stages"])]
+            stage_labels = sd.get("stage_labels") or _resolve_stage_labels(
+                sd["subtask_names"], sd["num_stages"], reward_mode
+            )
             viz_path = output_dir / f"sarm_prediction_ep{episode_idx}_{scheme}.png"
             gt_progress = sd["viz_gt_progress"] if not np.all(np.isnan(sd["viz_gt_progress"])) else None
             gt_stages = sd["viz_gt_stages"] if not np.all(np.isnan(sd["viz_gt_stages"])) else None
